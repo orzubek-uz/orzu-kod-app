@@ -672,15 +672,53 @@ export default function App() {
     }
   };
 
-  // Font Zoom Controls [ A- ] [ A+ ]
+  // Font Zoom Controls [ A- ] [ A+ ] & 2-Finger Pinch-to-Zoom
+  const pinchStartDistRef = useRef<number | null>(null);
+  const pinchStartFontSizeRef = useRef<number>(14);
+
   const handleFontDelta = async (delta: number) => {
     if (!activeRoom) return;
-    const nextSize = Math.min(28, Math.max(10, (activeRoom.fontSize || 14) + delta));
+    const nextSize = Math.min(32, Math.max(10, (activeRoom.fontSize || 14) + delta));
     await updateRoom({
       ...activeRoom,
       fontSize: nextSize,
       updatedAt: Date.now(),
     });
+  };
+
+  const handleEditorTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (e.touches.length === 2 && activeRoom) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      pinchStartDistRef.current = Math.hypot(dx, dy);
+      pinchStartFontSizeRef.current = activeRoom.fontSize || 14;
+    }
+  };
+
+  const handleEditorTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (e.touches.length === 2 && pinchStartDistRef.current && activeRoom) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const currentDist = Math.hypot(dx, dy);
+      if (pinchStartDistRef.current > 0) {
+        const scale = currentDist / pinchStartDistRef.current;
+        const nextSize = Math.min(
+          32,
+          Math.max(10, Math.round(pinchStartFontSizeRef.current * scale))
+        );
+        if (nextSize !== activeRoom.fontSize) {
+          updateRoom({
+            ...activeRoom,
+            fontSize: nextSize,
+            updatedAt: Date.now(),
+          });
+        }
+      }
+    }
+  };
+
+  const handleEditorTouchEnd = () => {
+    pinchStartDistRef.current = null;
   };
 
   // File Upload into Room
@@ -1031,15 +1069,36 @@ export default function App() {
           </div>
 
           {/* Anti-Corruption Synchronized Code Editor */}
-          <div className="ios-glass rounded-2xl flex-1 flex overflow-hidden shadow-2xl min-h-0">
+          <div
+            onTouchStart={handleEditorTouchStart}
+            onTouchMove={handleEditorTouchMove}
+            onTouchEnd={handleEditorTouchEnd}
+            style={{
+              flex: 1,
+              height: '100%',
+              overflowY: 'auto',
+              overflowX: 'auto',
+              display: 'flex',
+              alignItems: 'stretch',
+              position: 'relative',
+              WebkitOverflowScrolling: 'touch',
+            }}
+            className="editor-scroll-container ios-glass rounded-2xl shadow-2xl min-h-0"
+          >
             {/* Synchronized Line Numbers */}
             <div
               ref={lineNumbersRef}
               style={{
                 fontSize: `${activeRoom.fontSize || 14}px`,
                 lineHeight: '1.6',
+                minHeight: `${Math.max(
+                  (activeRoom.code ? activeRoom.code.split('\n').length : 1) *
+                    ((activeRoom.fontSize || 14) * 1.6) +
+                    100,
+                  600
+                )}px`,
               }}
-              className="code-editor-font select-none py-3 px-2.5 text-right text-slate-400/80 bg-black/30 border-r border-white/15 overflow-hidden shrink-0 min-w-[3rem]"
+              className="code-editor-font select-none py-3 px-2.5 text-right text-slate-400/80 bg-black/30 border-r border-white/15 shrink-0 min-w-[3rem]"
             >
               {lineNumbersArray.map((num) => (
                 <div key={num}>{num}</div>
@@ -1066,11 +1125,22 @@ export default function App() {
               autoComplete="off"
               data-gramm="false"
               style={{
+                flex: 1,
+                width: '100%',
+                minHeight: '100%',
+                height: `${Math.max(
+                  (activeRoom.code ? activeRoom.code.split('\n').length : 1) *
+                    ((activeRoom.fontSize || 14) * 1.6) +
+                    100,
+                  600
+                )}px`,
+                overflow: 'hidden',
+                resize: 'none',
                 fontSize: `${activeRoom.fontSize || 14}px`,
                 lineHeight: '1.6',
                 tabSize: 2,
               }}
-              className="code-editor-font flex-1 w-full h-full p-3 bg-transparent text-slate-100 focus:outline-none resize-none overflow-auto whitespace-pre"
+              className="code-editor-font p-3 bg-transparent text-slate-100 focus:outline-none whitespace-pre"
             />
           </div>
         </div>
