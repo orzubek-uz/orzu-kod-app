@@ -1,0 +1,6 @@
+{
+  "name": "OrzuKod",
+  "description": "OrzuKod — Yuqori tezlikdagi veb-ilova serveri va kod dvigateli.",
+  "requestFramePermissions": ["clipboard-read", "clipboard-write"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
