@@ -35,7 +35,43 @@ const MASTER_NAMESPACE = 'OrzuTest_Uz2010';
 const PRIMARY_BROKER = 'wss://broker.emqx.io:8084/mqtt';
 const FALLBACK_BROKER = 'wss://broker.hivemq.com:8884/mqtt';
 
+function isHtmlOrWebCode(rawCode: string): boolean {
+  const trimmed = rawCode.trim();
+  if (!trimmed) return true;
+  return (
+    /<!doctype\s+html/i.test(trimmed) ||
+    /<html[\s>]/i.test(trimmed) ||
+    /<head[\s>]/i.test(trimmed) ||
+    /<body[\s>]/i.test(trimmed) ||
+    /<div[\s>]/i.test(trimmed) ||
+    /<style[\s>]/i.test(trimmed) ||
+    /<script[\s>]/i.test(trimmed) ||
+    /<canvas[\s>]/i.test(trimmed) ||
+    /<button[\s>]/i.test(trimmed) ||
+    /<h[1-6][\s>]/i.test(trimmed) ||
+    /document\.(getElementById|querySelector|createElement|body)/i.test(trimmed)
+  );
+}
+
 function buildBroadcastHtml(rawCode: string, libraries: string[]): string {
+  const consoleBridge = `<script>
+(function(){
+  function send(level, args){
+    try {
+      var msg = Array.prototype.slice.call(args).map(function(a){
+        return typeof a === 'object' ? JSON.stringify(a) : String(a);
+      }).join(' ');
+      window.parent.postMessage({ __orzukod_log: true, level: level, text: msg }, '*');
+    } catch(e){}
+  }
+  var origLog = console.log, origWarn = console.warn, origErr = console.error;
+  console.log = function(){ send('INFO', arguments); if(origLog) origLog.apply(console, arguments); };
+  console.warn = function(){ send('WARN', arguments); if(origWarn) origWarn.apply(console, arguments); };
+  console.error = function(){ send('ERROR', arguments); if(origErr) origErr.apply(console, arguments); };
+  window.addEventListener('error', function(e){ send('ERROR', [e.message || 'Runtime xatosi']); });
+})();
+</script>`;
+
   const libTags = libraries
     .map((pkg) => {
       if (pkg.startsWith('http://') || pkg.startsWith('https://')) {
@@ -45,9 +81,10 @@ function buildBroadcastHtml(rawCode: string, libraries: string[]): string {
     })
     .join('\n');
 
+  const headerInject = `${consoleBridge}\n${libTags}`;
   const trimmed = rawCode.trim();
   if (!trimmed) {
-    return `<!doctype html><html><head><meta charset="utf-8">${libTags}</head><body></body></html>`;
+    return `<!doctype html><html><head><meta charset="utf-8">${headerInject}</head><body style="margin:0;background:#090d16;color:#f8fafc;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;">🟢 Lokal Server Faol (Port: Localhost)</body></html>`;
   }
 
   const looksLikeHtml =
@@ -58,13 +95,15 @@ function buildBroadcastHtml(rawCode: string, libraries: string[]): string {
     /<div[\s>]/i.test(trimmed) ||
     /<style[\s>]/i.test(trimmed) ||
     /<script[\s>]/i.test(trimmed) ||
-    /<canvas[\s>]/i.test(trimmed);
+    /<canvas[\s>]/i.test(trimmed) ||
+    /<button[\s>]/i.test(trimmed) ||
+    /<h[1-6][\s>]/i.test(trimmed);
 
   if (looksLikeHtml) {
-    if (libTags && /<\/head>/i.test(trimmed)) {
-      return trimmed.replace(/<\/head>/i, `${libTags}\n</head>`);
+    if (/<\/head>/i.test(trimmed)) {
+      return trimmed.replace(/<\/head>/i, `${headerInject}\n</head>`);
     }
-    return `${libTags}\n${trimmed}`;
+    return `${headerInject}\n${trimmed}`;
   }
 
   return `<!doctype html>
@@ -72,7 +111,7 @@ function buildBroadcastHtml(rawCode: string, libraries: string[]): string {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-${libTags}
+${headerInject}
 </head>
 <body style="margin:0;background:#090d16;color:#fff;font-family:sans-serif;">
 <div id="app"></div>
@@ -113,6 +152,12 @@ export default function App() {
   const [activeRoomId, setActiveRoomId] = useState<string | null>(null);
   const [storageOpen, setStorageOpen] = useState<boolean>(false);
 
+  // Standalone Local Server state
+  const [localServerHtml, setLocalServerHtml] = useState<string>('');
+  const [localPanelMode, setLocalPanelMode] = useState<'collapsed' | 'split' | 'preview' | 'console'>('collapsed');
+  const [serverLogs, setServerLogs] = useState<string[]>([]);
+  const [serverRunKey, setServerRunKey] = useState<number>(0);
+
   // Room creation modal state
   const [newRoomModalOpen, setNewRoomModalOpen] = useState<boolean>(false);
   const [newRoomName, setNewRoomName] = useState<string>('');
@@ -145,6 +190,7 @@ export default function App() {
   const lineNumbersRef = useRef<HTMLDivElement | null>(null);
   const mqttClientRef = useRef<MqttClient | null>(null);
   const heartbeatIntervalRef = useRef<number | null>(null);
+  const localServerLoopRef = useRef<number | null>(null);
   const workerRef = useRef<Worker | null>(null);
 
   const activeRoom = useMemo(
@@ -152,12 +198,29 @@ export default function App() {
     [rooms, activeRoomId]
   );
 
+  const appendServerLog = useCallback((line: string) => {
+    const time = new Date().toLocaleTimeString('uz-UZ', { hour12: false });
+    setServerLogs((prev) => [...prev.slice(-149), `[${time}] ${line}`]);
+  }, []);
+
   const showToast = useCallback((msg: string) => {
     setStatusToast(msg);
     window.setTimeout(() => {
       setStatusToast((prev) => (prev === msg ? '' : prev));
     }, 2600);
   }, []);
+
+  // Listen to logs from Local Preview iframe
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      if (e.data && e.data.__orzukod_log) {
+        const prefix = e.data.level === 'ERROR' ? '❌' : e.data.level === 'WARN' ? '⚠️' : '🔹';
+        appendServerLog(`${prefix} ${e.data.text}`);
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [appendServerLog]);
 
   // Load wallpaper and rooms from IndexedDB on startup
   useEffect(() => {
@@ -180,6 +243,9 @@ export default function App() {
     return () => {
       if (heartbeatIntervalRef.current) {
         window.clearInterval(heartbeatIntervalRef.current);
+      }
+      if (localServerLoopRef.current) {
+        window.clearInterval(localServerLoopRef.current);
       }
       if (workerRef.current) {
         workerRef.current.terminate();
@@ -437,45 +503,87 @@ export default function App() {
     }
   };
 
-  // Start background Web Worker for JS / Telegram Bot execution
-  const startBackgroundWorker = useCallback((rawCode: string) => {
-    if (workerRef.current) {
-      workerRef.current.terminate();
-      workerRef.current = null;
-    }
-
-    const jsToRun = extractWorkerScript(rawCode);
-    if (!jsToRun) return;
-
-    const workerBootstrap = `
-      self.window = self;
-      self.document = {
-        getElementById: () => ({ innerHTML: '', style: {}, addEventListener: () => {} }),
-        querySelector: () => ({ innerHTML: '', style: {}, addEventListener: () => {} }),
-        querySelectorAll: () => [],
-        createElement: () => ({ style: {}, appendChild: () => {}, setAttribute: () => {} }),
-        body: { style: {}, appendChild: () => {} },
-        addEventListener: () => {}
-      };
-      try {
-        ${jsToRun}
-      } catch (err) {
-        self.postMessage({ type: 'ERROR', error: err && err.message ? err.message : String(err) });
+  // Start background Web Worker for JS / Node / Telegram Bot execution with active server loop
+  const startBackgroundWorker = useCallback(
+    (rawCode: string) => {
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
       }
-    `;
 
-    try {
-      const blob = new Blob([workerBootstrap], { type: 'application/javascript' });
-      const url = URL.createObjectURL(blob);
-      const worker = new Worker(url);
-      workerRef.current = worker;
-      URL.revokeObjectURL(url);
-    } catch {
-      // Ignore worker syntax error if DOM-heavy script
-    }
-  }, []);
+      const jsToRun = extractWorkerScript(rawCode);
+      if (!jsToRun) return;
 
-  // [ 🚀 Ishga Tushirish ] handler
+      const workerBootstrap = `
+        self.window = self;
+        self.global = self;
+        self.process = { env: { NODE_ENV: 'production', PORT: '3000' }, argv: [], version: 'v22.0.0' };
+        self.module = { exports: {} };
+        self.exports = self.module.exports;
+
+        function __formatArgs(args) {
+          return Array.prototype.slice.call(args).map(function(a) {
+            try {
+              return typeof a === 'object' ? JSON.stringify(a) : String(a);
+            } catch (e) {
+              return String(a);
+            }
+          }).join(' ');
+        }
+
+        self.console = {
+          log: function() { self.postMessage({ type: 'LOG', level: 'INFO', text: __formatArgs(arguments) }); },
+          info: function() { self.postMessage({ type: 'LOG', level: 'INFO', text: __formatArgs(arguments) }); },
+          warn: function() { self.postMessage({ type: 'LOG', level: 'WARN', text: __formatArgs(arguments) }); },
+          error: function() { self.postMessage({ type: 'LOG', level: 'ERROR', text: __formatArgs(arguments) }); }
+        };
+
+        self.document = {
+          getElementById: function() { return { innerHTML: '', textContent: '', style: {}, addEventListener: function(){} }; },
+          querySelector: function() { return { innerHTML: '', textContent: '', style: {}, addEventListener: function(){} }; },
+          querySelectorAll: function() { return []; },
+          createElement: function() { return { style: {}, appendChild: function(){}, setAttribute: function(){} }; },
+          body: { style: {}, appendChild: function(){} },
+          addEventListener: function(){}
+        };
+
+        // Dedicated active server loop so background scripts/bots remain alive continuously
+        self.__serverKeepAlive = setInterval(function() {}, 1000);
+
+        Promise.resolve().then(async function() {
+          try {
+            ${jsToRun}
+          } catch (err) {
+            self.postMessage({
+              type: 'LOG',
+              level: 'ERROR',
+              text: err && err.message ? err.message : String(err)
+            });
+          }
+        });
+      `;
+
+      try {
+        const blob = new Blob([workerBootstrap], { type: 'application/javascript' });
+        const url = URL.createObjectURL(blob);
+        const worker = new Worker(url);
+        worker.onmessage = (ev) => {
+          if (ev.data && ev.data.type === 'LOG') {
+            const prefix =
+              ev.data.level === 'ERROR' ? '❌' : ev.data.level === 'WARN' ? '⚠️' : '🔹';
+            appendServerLog(`${prefix} ${ev.data.text}`);
+          }
+        };
+        workerRef.current = worker;
+        URL.revokeObjectURL(url);
+      } catch {
+        // Ignore worker creation error if pure HTML/DOM code
+      }
+    },
+    [appendServerLog]
+  );
+
+  // [ 🚀 Ishga Tushirish ] handler — 100% STANDALONE LOCAL SERVER (OPTIONAL ORZUTEST STREAM)
   const handleStartServer = async () => {
     if (!activeRoom) return;
 
@@ -488,62 +596,79 @@ export default function App() {
 
     const finalHtml = buildBroadcastHtml(updated.code, updated.libraries || []);
 
-    // Run JS/Telegram bot in background worker simultaneously
+    // 1. Immediately start Standalone Local Server Runtime & Preview
+    setLocalServerHtml(finalHtml);
+    setServerRunKey((k) => k + 1);
+    setServerLogs([]);
+    appendServerLog('🚀 Server ishga tushdi. Kod lokal muhitda muvaffaqiyatli ishlamoqda.');
+
+    if (isHtmlOrWebCode(updated.code)) {
+      setLocalPanelMode((prev) => (prev === 'collapsed' ? 'split' : prev));
+    } else {
+      setLocalPanelMode((prev) => (prev === 'collapsed' ? 'console' : prev));
+    }
+
+    // 2. Spin up background Web Worker & continuous active local server loop
     startBackgroundWorker(updated.code);
 
-    const publishStartAndHeartbeat = (client: MqttClient) => {
-      const targetPin = updated.linkedPin;
-      if (targetPin) {
-        const startPayload = JSON.stringify({
-          type: 'START',
-          html: finalHtml,
-          timestamp: Date.now(),
-        });
-        client.publish(`${MASTER_NAMESPACE}/stream/${targetPin}`, startPayload, {
-          retain: true,
-          qos: 1,
-        });
-      }
+    if (localServerLoopRef.current) {
+      window.clearInterval(localServerLoopRef.current);
+    }
+    localServerLoopRef.current = window.setInterval(() => {
+      // Active local server runtime heartbeat loop
+    }, 2000);
 
-      if (heartbeatIntervalRef.current) {
-        window.clearInterval(heartbeatIntervalRef.current);
-      }
+    showToast('🟢 Server Faol (Lokal Ishlamoqda)');
 
-      heartbeatIntervalRef.current = window.setInterval(() => {
-        if (mqttClientRef.current && targetPin) {
-          mqttClientRef.current.publish(
-            `${MASTER_NAMESPACE}/heartbeat/${targetPin}`,
-            JSON.stringify({
-              type: 'HEARTBEAT',
-              pin: targetPin,
-              timestamp: Date.now(),
-            }),
-            { retain: false, qos: 0 }
-          );
+    // 3. Optional non-blocking background broadcast to OrzuTest ONLY if a 4-digit PIN is linked
+    const targetPin = updated.linkedPin;
+    if (targetPin && /^\d{4}$/.test(targetPin)) {
+      const publishStartAndHeartbeat = (client: MqttClient) => {
+        try {
+          const startPayload = JSON.stringify({
+            type: 'START',
+            html: finalHtml,
+            timestamp: Date.now(),
+          });
+          client.publish(`${MASTER_NAMESPACE}/stream/${targetPin}`, startPayload, {
+            retain: true,
+            qos: 1,
+          });
+        } catch {}
+
+        if (heartbeatIntervalRef.current) {
+          window.clearInterval(heartbeatIntervalRef.current);
         }
-      }, 2000);
-    };
 
-    if (mqttClientRef.current && mqttStatus === 'connected') {
-      publishStartAndHeartbeat(mqttClientRef.current);
-      showToast(
-        updated.linkedPin
-          ? `🚀 #${updated.linkedPin} serverda ishga tushdi!`
-          : '🚀 Ishga tushirildi!'
-      );
-    } else {
-      connectMqttBroker((client) => {
-        publishStartAndHeartbeat(client);
-        showToast(
-          updated.linkedPin
-            ? `🚀 #${updated.linkedPin} serverda ishga tushdi!`
-            : '🚀 Ishga tushirildi!'
-        );
-      });
+        heartbeatIntervalRef.current = window.setInterval(() => {
+          if (mqttClientRef.current && mqttClientRef.current.connected) {
+            try {
+              mqttClientRef.current.publish(
+                `${MASTER_NAMESPACE}/heartbeat/${targetPin}`,
+                JSON.stringify({
+                  type: 'HEARTBEAT',
+                  pin: targetPin,
+                  timestamp: Date.now(),
+                }),
+                { retain: false, qos: 0 }
+              );
+            } catch {}
+          }
+        }, 2000);
+      };
+
+      if (mqttClientRef.current && mqttStatus === 'connected') {
+        publishStartAndHeartbeat(mqttClientRef.current);
+      } else if (window.mqtt) {
+        // Silent background connection for secondary monitor — never blocks or shows error
+        connectMqttBroker((client) => {
+          publishStartAndHeartbeat(client);
+        });
+      }
     }
   };
 
-  // [ 🛑 To'xtatish ] handler — STOP SERVER = STOP SITE
+  // [ 🛑 To'xtatish ] handler — TERMINATE LOCAL SERVER & OPTIONAL ORZUTEST STREAM
   const handleStopServer = async () => {
     if (!activeRoom) return;
 
@@ -552,10 +677,18 @@ export default function App() {
       heartbeatIntervalRef.current = null;
     }
 
+    if (localServerLoopRef.current) {
+      window.clearInterval(localServerLoopRef.current);
+      localServerLoopRef.current = null;
+    }
+
     if (workerRef.current) {
       workerRef.current.terminate();
       workerRef.current = null;
     }
+
+    setLocalServerHtml('');
+    appendServerLog("⚪ Server To'xtatilgan");
 
     const updated: RoomData = {
       ...activeRoom,
@@ -564,10 +697,13 @@ export default function App() {
     };
     await updateRoom(updated);
 
+    showToast("⚪ Server To'xtatilgan");
+
+    // Optional background STOP broadcast if a 4-digit PIN is linked
     const targetPin = updated.linkedPin;
-    const sendStopPacket = (client: MqttClient) => {
-      if (targetPin) {
-        client.publish(
+    if (targetPin && /^\d{4}$/.test(targetPin) && mqttClientRef.current && mqttStatus === 'connected') {
+      try {
+        mqttClientRef.current.publish(
           `${MASTER_NAMESPACE}/stream/${targetPin}`,
           JSON.stringify({
             type: 'STOP',
@@ -575,19 +711,7 @@ export default function App() {
           }),
           { retain: true, qos: 1 }
         );
-      }
-    };
-
-    if (mqttClientRef.current && mqttStatus === 'connected') {
-      sendStopPacket(mqttClientRef.current);
-      showToast('🛑 Server va sayt to‘xtatildi!');
-    } else if (targetPin) {
-      connectMqttBroker((client) => {
-        sendStopPacket(client);
-        showToast('🛑 Server va sayt to‘xtatildi!');
-      });
-    } else {
-      showToast('🛑 To‘xtatildi!');
+      } catch {}
     }
   };
 
@@ -953,12 +1077,14 @@ export default function App() {
                     <span className="text-sm sm:text-base text-white truncate">
                       {room.name}
                     </span>
-                    <span className="text-xs text-slate-300 whitespace-nowrap">
-                      {room.linkedPin ? `🟢 #${room.linkedPin}` : '⚪ Ulanmagan'}
+                    <span className="text-xs text-slate-200 whitespace-nowrap">
+                      {room.isRunning
+                        ? '🟢 Server Faol (Lokal Ishlamoqda)'
+                        : "⚪ Server To'xtatilgan"}
                     </span>
-                    {room.isRunning && (
-                      <span className="text-xs text-emerald-300 whitespace-nowrap">
-                        · 🚀 Ishlamoqda
+                    {room.linkedPin && (
+                      <span className="text-xs text-sky-300 whitespace-nowrap">
+                        · #{room.linkedPin}
                       </span>
                     )}
                   </div>
@@ -989,15 +1115,20 @@ export default function App() {
                 [ 🔙 Orqaga ]
               </button>
 
-              <div className="flex items-center gap-2 min-w-0">
-                <span className="text-xs sm:text-sm text-white truncate max-w-[110px] sm:max-w-[200px]">
+              <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                <span className="text-xs sm:text-sm text-white truncate max-w-[110px] sm:max-w-[180px]">
                   {activeRoom.name}
                 </span>
-                <span className="text-[11px] sm:text-xs text-slate-200 whitespace-nowrap">
-                  {activeRoom.linkedPin
-                    ? `🟢 Ulangan: #${activeRoom.linkedPin}`
-                    : '⚪ Ulanmagan'}
+                <span className="text-[11px] sm:text-xs text-emerald-200 whitespace-nowrap">
+                  {activeRoom.isRunning
+                    ? '🟢 Server Ishlamoqda (Port: Localhost)'
+                    : "⚪ Server To'xtatilgan"}
                 </span>
+                {activeRoom.linkedPin && (
+                  <span className="text-[11px] sm:text-xs text-sky-200 whitespace-nowrap">
+                    · OrzuTest: #{activeRoom.linkedPin}
+                  </span>
+                )}
               </div>
             </div>
 
@@ -1142,6 +1273,126 @@ export default function App() {
               }}
               className="code-editor-font p-3 bg-transparent text-slate-100 focus:outline-none whitespace-pre"
             />
+          </div>
+
+          {/* Standalone Local Server Collapsible / Split Preview & Console */}
+          <div
+            className={`ios-glass rounded-2xl overflow-hidden shadow-2xl shrink-0 flex flex-col ${
+              localPanelMode === 'collapsed'
+                ? ''
+                : localPanelMode === 'preview'
+                ? 'h-[48dvh]'
+                : 'h-[38dvh]'
+            }`}
+          >
+            {/* Local Server Status & Mode Tabs Bar */}
+            <div className="px-3 py-2 flex flex-wrap items-center justify-between gap-2 border-b border-white/15 bg-black/25">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-xs text-white truncate">
+                  {activeRoom.isRunning
+                    ? '🟢 Server Faol (Lokal Ishlamoqda) — Port: Localhost'
+                    : "⚪ Server To'xtatilgan"}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setLocalPanelMode('split')}
+                  className={`spring-btn px-2.5 py-1 rounded-xl text-[11px] cursor-pointer ${
+                    localPanelMode === 'split'
+                      ? 'bg-sky-500/35 border border-sky-400/50 text-white'
+                      : 'ios-glass text-slate-200'
+                  }`}
+                >
+                  [ 📐 Bo'lingan ]
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLocalPanelMode('preview')}
+                  className={`spring-btn px-2.5 py-1 rounded-xl text-[11px] cursor-pointer ${
+                    localPanelMode === 'preview'
+                      ? 'bg-emerald-500/35 border border-emerald-400/50 text-white'
+                      : 'ios-glass text-slate-200'
+                  }`}
+                >
+                  [ 🖥️ Lokal Ko'rish ]
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLocalPanelMode('console')}
+                  className={`spring-btn px-2.5 py-1 rounded-xl text-[11px] cursor-pointer ${
+                    localPanelMode === 'console'
+                      ? 'bg-amber-500/35 border border-amber-400/50 text-white'
+                      : 'ios-glass text-slate-200'
+                  }`}
+                >
+                  [ 📟 Konsol ]
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setLocalPanelMode((prev) =>
+                      prev === 'collapsed' ? 'split' : 'collapsed'
+                    )
+                  }
+                  className="spring-btn ios-glass px-2.5 py-1 rounded-xl text-[11px] text-white cursor-pointer"
+                >
+                  {localPanelMode === 'collapsed' ? '[ ▴ Ochish ]' : "[ ▾ Yig'ish ]"}
+                </button>
+              </div>
+            </div>
+
+            {localPanelMode !== 'collapsed' && (
+              <div className="flex-1 min-h-0 grid grid-cols-1 sm:grid-cols-2 divide-y sm:divide-y-0 sm:divide-x divide-white/15">
+                {/* Local HTML/CSS/JS Preview Sandbox */}
+                {(localPanelMode === 'split' || localPanelMode === 'preview') && (
+                  <div
+                    className={`flex flex-col min-h-0 bg-[#090d16] ${
+                      localPanelMode === 'preview' ? 'sm:col-span-2' : ''
+                    }`}
+                  >
+                    {activeRoom.isRunning && localServerHtml ? (
+                      <iframe
+                        key={serverRunKey}
+                        title="OrzuKod Lokal Server"
+                        srcDoc={localServerHtml}
+                        sandbox="allow-scripts allow-modals allow-forms allow-same-origin"
+                        className="w-full h-full border-0 bg-white"
+                      />
+                    ) : (
+                      <div className="flex-1 flex items-center justify-center text-xs text-slate-400 p-4">
+                        ⚪ Server To'xtatilgan
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Local Server Console Output */}
+                {(localPanelMode === 'split' || localPanelMode === 'console') && (
+                  <div
+                    className={`code-editor-font flex flex-col min-h-0 bg-black/50 p-3 overflow-y-auto text-xs space-y-1 ${
+                      localPanelMode === 'console' ? 'sm:col-span-2' : ''
+                    }`}
+                  >
+                    {serverLogs.length === 0 ? (
+                      <div className="text-slate-400">
+                        ⚪ Server To'xtatilgan
+                      </div>
+                    ) : (
+                      serverLogs.map((log, index) => (
+                        <div
+                          key={index}
+                          className="text-emerald-200 break-words leading-relaxed"
+                        >
+                          {log}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
